@@ -34,6 +34,10 @@ int64_t get_raw_value(const std::vector<uint8_t> &msg, const Signal &sig) {
 
 
 bool MessageState::parse(uint64_t nanos, const std::vector<uint8_t> &dat) {
+  std::vector<double> tmp_vals(parse_sigs.size());
+  bool checksum_failed = false;
+  bool counter_failed = false;
+
   for (int i = 0; i < parse_sigs.size(); i++) {
     const auto &sig = parse_sigs[i];
 
@@ -44,27 +48,29 @@ bool MessageState::parse(uint64_t nanos, const std::vector<uint8_t> &dat) {
 
     //DEBUG("parse 0x%X %s -> %ld\n", address, sig.name, tmp);
 
-    bool checksum_failed = false;
     if (!ignore_checksum) {
       if (sig.calc_checksum != nullptr && sig.calc_checksum(address, sig, dat) != tmp) {
         checksum_failed = true;
       }
     }
 
-    bool counter_failed = false;
     if (!ignore_counter) {
-      if (sig.type == SignalType::COUNTER) {
-        counter_failed = !update_counter_generic(tmp, sig.size);
+      if (sig.type == SignalType::COUNTER && !update_counter_generic(tmp, sig.size)) {
+        counter_failed = true;
       }
     }
 
-    if (checksum_failed || counter_failed) {
-      LOGE("0x%X message checks failed, checksum failed %d, counter failed %d", address, checksum_failed, counter_failed);
-      return false;
-    }
+    tmp_vals[i] = tmp * sig.factor + sig.offset;
+  }
 
-    // TODO: these may get updated if the invalid or checksum gets checked later
-    vals[i] = tmp * sig.factor + sig.offset;
+  // only update values if both checksum and counter are valid
+  if (checksum_failed || counter_failed) {
+    LOGE("0x%X message checks failed, checksum failed %d, counter failed %d", address, checksum_failed, counter_failed);
+    return false;
+  }
+
+  for (int i = 0; i < parse_sigs.size(); i++) {
+    vals[i] = tmp_vals[i];
     all_vals[i].push_back(vals[i]);
   }
   last_seen_nanos = nanos;
@@ -74,20 +80,16 @@ bool MessageState::parse(uint64_t nanos, const std::vector<uint8_t> &dat) {
 
 
 bool MessageState::update_counter_generic(int64_t v, int cnt_size) {
-  uint8_t old_counter = counter;
-  counter = v;
-  if (((old_counter+1) & ((1 << cnt_size) -1)) != v) {
-    counter_fail += 1;
+  if (((counter + 1) & ((1 << cnt_size) -1)) != v) {
+    counter_fail = std::min(counter_fail + 1, MAX_BAD_COUNTER);
     if (counter_fail > 1) {
-      INFO("0x%X COUNTER FAIL #%d -- %d -> %d\n", address, counter_fail, old_counter, (int)v);
-    }
-    if (counter_fail >= MAX_BAD_COUNTER) {
-      return false;
+      INFO("0x%X COUNTER FAIL #%d -- %d -> %d\n", address, counter_fail, counter, (int)v);
     }
   } else if (counter_fail > 0) {
     counter_fail--;
   }
-  return true;
+  counter = v;
+  return counter_fail < MAX_BAD_COUNTER;
 }
 
 
